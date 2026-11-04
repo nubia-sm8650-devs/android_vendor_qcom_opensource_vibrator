@@ -31,6 +31,8 @@
 #define QTI_VIBRATOR_EFFECT_STREAM_H
 #include <sys/types.h>
 
+#define TIMED_ID_MASK           0x4000
+
 struct effect_stream {
     uint32_t   	    effect_id;
     uint32_t        length;

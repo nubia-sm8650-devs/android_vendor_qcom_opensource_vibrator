@@ -515,6 +515,19 @@ int InputFFDevice::playNative(int effectId, uint32_t timeoutMs, long *playLength
     if (timeoutMs == 0)
         return stopNative();
 
+#ifdef USE_EFFECT_STREAM
+    if (effectId == INVALID_VALUE && mSupportEffects && timeoutMs < TIMED_ID_MASK) {
+        stream = get_effect_stream(TIMED_ID_MASK | timeoutMs);
+        if (stream) {
+            ret = uploadWaveform(stream, &id, &lengthMs);
+            if (ret)
+                return ret;
+
+            return startNative(id, mAmplitudeGain, true);
+        }
+    }
+#endif
+
     if (effectId == INVALID_VALUE) {
         ret = uploadRumble(timeoutMs, &id);
         if (ret)
