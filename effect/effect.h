@@ -32,6 +32,7 @@
 #include <sys/types.h>
 
 #define TIMED_ID_MASK           0x4000
+#define LOOP_EFFECT_ID          0x2000
 
 struct effect_stream {
     uint32_t   	    effect_id;

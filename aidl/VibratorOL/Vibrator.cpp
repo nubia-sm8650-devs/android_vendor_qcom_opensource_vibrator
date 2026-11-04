@@ -61,6 +61,7 @@ namespace vibrator {
 #define MAX_PATTERN_ID          32767
 #define MAX_GAIN                0xffff
 #define NATIVE_RATE_HZ          24000
+#define MAX_NATIVE_MS           10000
 
 #define MSM_CPU_LAHAINA         415
 #define APQ_CPU_LAHAINA         439
@@ -111,6 +112,7 @@ InputFFDevice::InputFFDevice()
     mInExternalControl = false;
     mNativeWaveforms = false;
     mRumbleId = INVALID_VALUE;
+    mLoopId = INVALID_VALUE;
     mPlayingId = INVALID_VALUE;
     mPlayingAmplitudeControl = false;
     mAmplitudeGain = MAX_GAIN;
@@ -179,7 +181,7 @@ InputFFDevice::InputFFDevice()
 #ifdef USE_EFFECT_STREAM
             if (test_bit(FF_CUSTOM, ffBitmask) && mNativeWaveforms &&
                     TEMP_FAILURE_RETRY(ioctl(fd, EVIOCGEFFECTS, &mMaxEffects)) != -1 &&
-                    mMaxEffects >= 3)
+                    mMaxEffects >= 4)
                 mSupportEffects = true;
 #endif
             if (test_bit(FF_GAIN, ffBitmask))
@@ -437,7 +439,7 @@ int InputFFDevice::uploadWaveform(const struct effect_stream *stream, int16_t *i
     for (i = 0; i < count; i++)
         samples[i] = stream->data[(uint64_t)i * stream->play_rate_hz / NATIVE_RATE_HZ] * 256;
 
-    if (mWaveforms.size() >= (size_t)mMaxEffects - 1) {
+    if (mWaveforms.size() >= (size_t)mMaxEffects - 2) {
         victim = mWaveforms.end();
         for (auto it = mWaveforms.begin(); it != mWaveforms.end(); it++) {
             if (it->id != mPlayingId &&
@@ -461,6 +463,34 @@ int InputFFDevice::uploadWaveform(const struct effect_stream *stream, int16_t *i
 
     *lengthMs = (count * 1000 + NATIVE_RATE_HZ - 1) / NATIVE_RATE_HZ;
     mWaveforms.push_back({stream, *id, *lengthMs, ++mUseCount});
+
+    return 0;
+#else
+    return -EINVAL;
+#endif
+}
+
+int InputFFDevice::uploadLoop(const struct effect_stream *stream, uint32_t timeoutMs,
+                              int16_t *id) {
+#ifdef USE_EFFECT_STREAM
+    std::vector<int16_t> samples;
+    size_t count, i;
+    int ret;
+
+    if (!stream->length || !stream->play_rate_hz)
+        return -EINVAL;
+
+    count = (uint64_t)timeoutMs * NATIVE_RATE_HZ / 1000;
+    samples.resize(count);
+    for (i = 0; i < count; i++)
+        samples[i] = stream->data[(uint64_t)i * stream->play_rate_hz / NATIVE_RATE_HZ %
+                                  stream->length] * 256;
+
+    ret = uploadSamples(samples, &mLoopId);
+    if (ret)
+        return ret;
+
+    *id = mLoopId;
 
     return 0;
 #else
@@ -520,6 +550,17 @@ int InputFFDevice::playNative(int effectId, uint32_t timeoutMs, long *playLength
         stream = get_effect_stream(TIMED_ID_MASK | timeoutMs);
         if (stream) {
             ret = uploadWaveform(stream, &id, &lengthMs);
+            if (ret)
+                return ret;
+
+            return startNative(id, mAmplitudeGain, true);
+        }
+    }
+
+    if (effectId == INVALID_VALUE && mSupportEffects && timeoutMs <= MAX_NATIVE_MS) {
+        stream = get_effect_stream(LOOP_EFFECT_ID);
+        if (stream) {
+            ret = uploadLoop(stream, timeoutMs, &id);
             if (ret)
                 return ret;
 
