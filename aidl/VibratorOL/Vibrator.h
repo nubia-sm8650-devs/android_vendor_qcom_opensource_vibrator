@@ -36,6 +36,9 @@
 #include <aidl/android/hardware/vibrator/BnVibrator.h>
 #include <thread>
 #include <mutex>
+#include <vector>
+
+struct effect_stream;
 
 namespace aidl {
 namespace android {
@@ -87,6 +90,14 @@ private:
     int startNative(int16_t id, uint16_t gain, bool amplitudeControl);
     int stopNative();
     int writeEvent(uint16_t code, int32_t value);
+    int uploadSamples(std::vector<int16_t> &samples, int16_t *id);
+    int uploadWaveform(const struct effect_stream *stream, int16_t *id, long *lengthMs);
+    struct CachedWaveform {
+        const struct effect_stream *stream;
+        int16_t id;
+        long lengthMs;
+        uint64_t lastUse;
+    };
     int mVibraFd;
     int16_t mCurrAppId;
     int16_t mCurrMagnitude;
@@ -95,6 +106,9 @@ private:
     int16_t mPlayingId;
     bool mPlayingAmplitudeControl;
     uint16_t mAmplitudeGain;
+    int mMaxEffects;
+    std::vector<CachedWaveform> mWaveforms;
+    uint64_t mUseCount;
     std::mutex mtx;
 };
 

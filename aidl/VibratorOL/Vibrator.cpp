@@ -60,6 +60,7 @@ namespace vibrator {
 #define PRIMITIVE_ID_MASK       0x8000
 #define MAX_PATTERN_ID          32767
 #define MAX_GAIN                0xffff
+#define NATIVE_RATE_HZ          24000
 
 #define MSM_CPU_LAHAINA         415
 #define APQ_CPU_LAHAINA         439
@@ -113,6 +114,8 @@ InputFFDevice::InputFFDevice()
     mPlayingId = INVALID_VALUE;
     mPlayingAmplitudeControl = false;
     mAmplitudeGain = MAX_GAIN;
+    mMaxEffects = 0;
+    mUseCount = 0;
 
     dp = opendir(INPUT_DIR);
     if (!dp) {
@@ -173,6 +176,12 @@ InputFFDevice::InputFFDevice()
 #endif
             if (test_bit(FF_CUSTOM, ffBitmask) && !mNativeWaveforms)
                 mSupportEffects = true;
+#ifdef USE_EFFECT_STREAM
+            if (test_bit(FF_CUSTOM, ffBitmask) && mNativeWaveforms &&
+                    TEMP_FAILURE_RETRY(ioctl(fd, EVIOCGEFFECTS, &mMaxEffects)) != -1 &&
+                    mMaxEffects >= 3)
+                mSupportEffects = true;
+#endif
             if (test_bit(FF_GAIN, ffBitmask))
                 mSupportGain = true;
 
@@ -376,6 +385,89 @@ int InputFFDevice::uploadRumble(uint32_t timeoutMs, int16_t *id) {
     return 0;
 }
 
+int InputFFDevice::uploadSamples(std::vector<int16_t> &samples, int16_t *id) {
+    struct ff_effect effect;
+    int ret;
+
+    memset(&effect, 0, sizeof(effect));
+    effect.type = FF_PERIODIC;
+    effect.id = *id;
+    effect.u.periodic.waveform = FF_CUSTOM;
+    effect.u.periodic.magnitude = STRONG_MAGNITUDE;
+    effect.u.periodic.custom_data = samples.data();
+    effect.u.periodic.custom_len = samples.size();
+
+    ret = TEMP_FAILURE_RETRY(ioctl(mVibraFd, EVIOCSFF, &effect));
+    if (ret == -1) {
+        ALOGE("ioctl EVIOCSFF failed, errno = %d", errno);
+        return -errno;
+    }
+
+    *id = effect.id;
+
+    return 0;
+}
+
+int InputFFDevice::uploadWaveform(const struct effect_stream *stream, int16_t *id,
+                                  long *lengthMs) {
+#ifdef USE_EFFECT_STREAM
+    std::vector<CachedWaveform>::iterator victim;
+    std::vector<int16_t> samples;
+    size_t count, i;
+    int ret;
+
+    for (auto &waveform : mWaveforms) {
+        if (waveform.stream == stream) {
+            waveform.lastUse = ++mUseCount;
+            *id = waveform.id;
+            *lengthMs = waveform.lengthMs;
+
+            return 0;
+        }
+    }
+
+    if (!stream->length || !stream->play_rate_hz)
+        return -EINVAL;
+
+    count = (uint64_t)stream->length * NATIVE_RATE_HZ / stream->play_rate_hz;
+    if (!count)
+        return -EINVAL;
+
+    samples.resize(count);
+    for (i = 0; i < count; i++)
+        samples[i] = stream->data[(uint64_t)i * stream->play_rate_hz / NATIVE_RATE_HZ] * 256;
+
+    if (mWaveforms.size() >= (size_t)mMaxEffects - 1) {
+        victim = mWaveforms.end();
+        for (auto it = mWaveforms.begin(); it != mWaveforms.end(); it++) {
+            if (it->id != mPlayingId &&
+                    (victim == mWaveforms.end() || it->lastUse < victim->lastUse))
+                victim = it;
+        }
+
+        ret = TEMP_FAILURE_RETRY(ioctl(mVibraFd, EVIOCRMFF, victim->id));
+        if (ret == -1) {
+            ALOGE("ioctl EVIOCRMFF failed, errno = %d", errno);
+            return -errno;
+        }
+
+        mWaveforms.erase(victim);
+    }
+
+    *id = INVALID_VALUE;
+    ret = uploadSamples(samples, id);
+    if (ret)
+        return ret;
+
+    *lengthMs = (count * 1000 + NATIVE_RATE_HZ - 1) / NATIVE_RATE_HZ;
+    mWaveforms.push_back({stream, *id, *lengthMs, ++mUseCount});
+
+    return 0;
+#else
+    return -EINVAL;
+#endif
+}
+
 int InputFFDevice::stopNative() {
     int ret;
 
@@ -415,20 +507,41 @@ int InputFFDevice::startNative(int16_t id, uint16_t gain, bool amplitudeControl)
 }
 
 int InputFFDevice::playNative(int effectId, uint32_t timeoutMs, long *playLengthMs) {
+    const struct effect_stream *stream = NULL;
+    long lengthMs;
     int16_t id;
     int ret;
 
     if (timeoutMs == 0)
         return stopNative();
 
-    if (effectId != INVALID_VALUE)
+    if (effectId == INVALID_VALUE) {
+        ret = uploadRumble(timeoutMs, &id);
+        if (ret)
+            return ret;
+
+        return startNative(id, mAmplitudeGain, true);
+    }
+
+#ifdef USE_EFFECT_STREAM
+    if (mSupportEffects)
+        stream = get_effect_stream(effectId);
+#endif
+    if (!stream)
         return -EINVAL;
 
-    ret = uploadRumble(timeoutMs, &id);
+    ret = uploadWaveform(stream, &id, &lengthMs);
     if (ret)
         return ret;
 
-    return startNative(id, mAmplitudeGain, true);
+    ret = startNative(id, mCurrMagnitude * MAX_GAIN / STRONG_MAGNITUDE, false);
+    if (ret)
+        return ret;
+
+    if (playLengthMs != NULL)
+        *playLengthMs = lengthMs;
+
+    return 0;
 }
 
 int InputFFDevice::on(int32_t timeoutMs) {
