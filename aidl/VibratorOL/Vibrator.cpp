@@ -59,6 +59,7 @@ namespace vibrator {
 #define NAME_BUF_SIZE           32
 #define PRIMITIVE_ID_MASK       0x8000
 #define MAX_PATTERN_ID          32767
+#define MAX_GAIN                0xffff
 
 #define MSM_CPU_LAHAINA         415
 #define APQ_CPU_LAHAINA         439
@@ -107,6 +108,11 @@ InputFFDevice::InputFFDevice()
     mCurrAppId = INVALID_VALUE;
     mCurrMagnitude = 0x7fff;
     mInExternalControl = false;
+    mNativeWaveforms = false;
+    mRumbleId = INVALID_VALUE;
+    mPlayingId = INVALID_VALUE;
+    mPlayingAmplitudeControl = false;
+    mAmplitudeGain = MAX_GAIN;
 
     dp = opendir(INPUT_DIR);
     if (!dp) {
@@ -162,7 +168,10 @@ InputFFDevice::InputFFDevice()
         if (test_bit(FF_CONSTANT, ffBitmask) ||
                 test_bit(FF_PERIODIC, ffBitmask)) {
             mVibraFd = fd;
-            if (test_bit(FF_CUSTOM, ffBitmask))
+#ifdef USE_MAINLINE_FF
+            mNativeWaveforms = true;
+#endif
+            if (test_bit(FF_CUSTOM, ffBitmask) && !mNativeWaveforms)
                 mSupportEffects = true;
             if (test_bit(FF_GAIN, ffBitmask))
                 mSupportGain = true;
@@ -240,6 +249,12 @@ int InputFFDevice::play(int effectId, uint32_t timeoutMs, long *playLengthMs) {
             *playLengthMs = 0;
         mtx.unlock();
         return 0;
+    }
+
+    if (mNativeWaveforms) {
+        ret = playNative(effectId, timeoutMs, playLengthMs);
+        mtx.unlock();
+        return ret;
     }
 
     if (timeoutMs != 0) {
@@ -321,6 +336,101 @@ errout:
     return ret;
 }
 
+int InputFFDevice::writeEvent(uint16_t code, int32_t value) {
+    struct input_event ie;
+    int ret;
+
+    memset(&ie, 0, sizeof(ie));
+    ie.type = EV_FF;
+    ie.code = code;
+    ie.value = value;
+
+    ret = TEMP_FAILURE_RETRY(write(mVibraFd, &ie, sizeof(ie)));
+    if (ret == -1) {
+        ALOGE("write EV_FF code %u failed, errno = %d", code, errno);
+        return -errno;
+    }
+
+    return 0;
+}
+
+int InputFFDevice::uploadRumble(uint32_t timeoutMs, int16_t *id) {
+    struct ff_effect effect;
+    int ret;
+
+    memset(&effect, 0, sizeof(effect));
+    effect.type = FF_RUMBLE;
+    effect.id = mRumbleId;
+    effect.u.rumble.strong_magnitude = MAX_GAIN;
+    effect.replay.length = std::min<uint32_t>(timeoutMs, UINT16_MAX);
+
+    ret = TEMP_FAILURE_RETRY(ioctl(mVibraFd, EVIOCSFF, &effect));
+    if (ret == -1) {
+        ALOGE("ioctl EVIOCSFF failed, errno = %d", errno);
+        return -errno;
+    }
+
+    mRumbleId = effect.id;
+    *id = effect.id;
+
+    return 0;
+}
+
+int InputFFDevice::stopNative() {
+    int ret;
+
+    if (mPlayingId == INVALID_VALUE)
+        return 0;
+
+    ret = writeEvent(mPlayingId, 0);
+    if (ret)
+        return ret;
+
+    mPlayingId = INVALID_VALUE;
+
+    return 0;
+}
+
+int InputFFDevice::startNative(int16_t id, uint16_t gain, bool amplitudeControl) {
+    int ret;
+
+    if (mPlayingId != id) {
+        ret = stopNative();
+        if (ret)
+            return ret;
+    }
+
+    ret = writeEvent(FF_GAIN, gain);
+    if (ret)
+        return ret;
+
+    ret = writeEvent(id, 1);
+    if (ret)
+        return ret;
+
+    mPlayingId = id;
+    mPlayingAmplitudeControl = amplitudeControl;
+
+    return 0;
+}
+
+int InputFFDevice::playNative(int effectId, uint32_t timeoutMs, long *playLengthMs) {
+    int16_t id;
+    int ret;
+
+    if (timeoutMs == 0)
+        return stopNative();
+
+    if (effectId != INVALID_VALUE)
+        return -EINVAL;
+
+    ret = uploadRumble(timeoutMs, &id);
+    if (ret)
+        return ret;
+
+    return startNative(id, mAmplitudeGain, true);
+}
+
 int InputFFDevice::on(int32_t timeoutMs) {
     return play(INVALID_VALUE, timeoutMs, NULL);
 }
@@ -337,6 +447,16 @@ int InputFFDevice::setAmplitude(uint8_t amplitude) {
     /* For QMAA compliance, return OK even if vibrator device doesn't exist */
     if (!isPresent())
         return 0;
+
+    if (mNativeWaveforms) {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        mAmplitudeGain = amplitude * MAX_GAIN / 255;
+        if (mPlayingId != INVALID_VALUE && mPlayingAmplitudeControl)
+            return writeEvent(FF_GAIN, mAmplitudeGain);
+
+        return 0;
+    }
 
     tmp = amplitude * STRONG_MAGNITUDE / 255;
     ie.type = EV_FF;

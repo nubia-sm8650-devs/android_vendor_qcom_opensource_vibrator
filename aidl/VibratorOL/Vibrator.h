@@ -82,9 +82,19 @@ public:
 
 private:
     int play(int effectId, uint32_t timeoutMs, long *playLengthMs);
+    int playNative(int effectId, uint32_t timeoutMs, long *playLengthMs);
+    int uploadRumble(uint32_t timeoutMs, int16_t *id);
+    int startNative(int16_t id, uint16_t gain, bool amplitudeControl);
+    int stopNative();
+    int writeEvent(uint16_t code, int32_t value);
     int mVibraFd;
     int16_t mCurrAppId;
     int16_t mCurrMagnitude;
+    bool mNativeWaveforms;
+    int16_t mRumbleId;
+    int16_t mPlayingId;
+    bool mPlayingAmplitudeControl;
+    uint16_t mAmplitudeGain;
     std::mutex mtx;
 };
 
